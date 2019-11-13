@@ -1,0 +1,350 @@
+/*
+===========================================================================================================================================
+|    Programmer: Daniel Gustafson                                                                                                         |
+|                                                                                                                                         |
+|    Version 1.0                                                                                                                          |
+|                                                                                                                                         | 
+|    Date: November 7, 2019                                                                                                               |  
+|                                                                                                                                         |
+|   Purpose:                                                                                                                              |  
+|    Provides a solution to mass update large record sets (greater 10000) declaratively                                                   |  
+|                                                                                                                                         |  
+|    -------------------------------------------------------------------------------------------------------------------------------      |
+|    |Version| Contributor            |Date      |Description/Reason                                                                      |  
+|    ------------------------------------------------------------------------------------------------------------------------------       |
+|    |       |                        |          |                                                                                        |  
+|    |       |                        |          |                                                                                        |  
+|    -------------------------------------------------------------------------------------------------------------------------------------|
+|==========================================================================================================================================    
+*/
+public without sharing class DataManagerClass {
+
+    public class DataManagerClassException extends Exception {}
+
+    public static boolean ThrowException_CodeCoverage = false;
+
+    // TIME 
+    private static integer ONE_SECOND = 1;
+    // LIMITS SECTION
+    public static integer  QueriesPerTransaction_LIMIT     = Limits.getLimitQueryRows(); // getQueryRows() 
+    public static integer  FuturePerTransaction_LIMIT      = Limits.getLimitFutureCalls(); //getFutureCalls()
+    public static integer  EmailPerTransaction_LIMIT       = Limits.getLimitEmailInvocations(); // getEmailInvocations()
+    public static integer  DMLPerTransaction_LIMIT         = Limits.getLimitDmlRows(); // getDMLStatements()
+    public static integer  RowsPerTransaction_LIMIT        = Limits.getLimitQueryRows(); // getQueryRows()
+    private static integer DATA_BATCH_SIZE                 = DMLPerTransaction_LIMIT;
+
+    // Primary variables
+    private static List<Data_Manager__mdt> DataManagerList = new List<Data_Manager__mdt>();
+    private static List<ID> IDsToProcess = new List<ID>();
+    private static List<ID> IDsMarked = new List<ID>();
+    private static List<SObject> objects = new List<SObject>();
+    private static String query;
+
+    public DataManagerClass() {
+        // Set limit values
+        QueriesPerTransaction_LIMIT     = Limits.getLimitQueryRows(); // getQueryRows() 
+        FuturePerTransaction_LIMIT      = Limits.getLimitFutureCalls(); //getFutureCalls()
+        EmailPerTransaction_LIMIT       = Limits.getLimitEmailInvocations(); // getEmailInvocations()
+        DMLPerTransaction_LIMIT         = Limits.getLimitDmlRows(); // getDMLStatements()
+        RowsPerTransaction_LIMIT        = Limits.getLimitQueryRows(); // getQueryRows()
+    }
+
+    public static void execute () {
+        String empty = '';
+        execute (empty); 
+    } 
+
+    public static void execute (String ProjectName) 
+    { 
+        String ComparativeOperator = '';
+
+        system.debug('inside execute');
+
+        if (ProjectName == '') {
+            // Running all available projects
+            query = 'SELECT Verb__c, Value_Is_Blank__c, Record_Count__c, Label, Object_API_Name__c, New_Value_Is_Blank__c, New_Value__c, Has_Criteria__c, Compare_Value__c, Comparative_Operator__c, Compare_API_Field_Name__c, API_Field_Name__c, Add_Suffix_Iterator__c, Active__c FROM Data_Manager__mdt WHERE Active__c = true LIMIT ' + DMLPerTransaction_LIMIT;
+        }
+        else {
+            // Select a specific project to run
+            query = 'SELECT Verb__c, Value_Is_Blank__c, Record_Count__c, Label, Object_API_Name__c, New_Value_Is_Blank__c, New_Value__c, Has_Criteria__c, Compare_Value__c, Comparative_Operator__c, Compare_API_Field_Name__c, API_Field_Name__c, Add_Suffix_Iterator__c, Active__c FROM Data_Manager__mdt WHERE Active__c = true  AND Label =:ProjectName LIMIT ' + DMLPerTransaction_LIMIT;
+        }
+        DataManagerList = database.query(query);
+        
+        system.debug('DataManagerList: ' + DataManagerList);
+        for (Data_Manager__mdt DataManager : DataManagerList) {
+            system.debug('loop');
+            Integer TotalRecords = (Integer) DataManager.Record_Count__c;
+            Integer RecordCount = 0;
+            Integer TotalCallsNeeded = 0;
+            Integer CallsMade        = 0;
+            Integer TotalRecordsProcessed = 0;
+            Integer RecordBatch           = 0;
+            Integer LastCount             = 0;
+
+            if (DataManager.Verb__c == 'Insert') {
+                // Inserting
+                if (TotalRecords > 0) {
+                    // How many future calls do we need
+                    TotalCallsNeeded = (TotalRecords / DMLPerTransaction_LIMIT);
+                    TotalCallsNeeded++;
+                }
+                while (CallsMade < TotalCallsNeeded) {
+                    RecordBatch = TotalRecords - (DMLPerTransaction_LIMIT * CallsMade);
+                    RecordCount = (RecordBatch > DMLPerTransaction_LIMIT) ? DMLPerTransaction_LIMIT : RecordBatch; 
+                    system.debug('RecordCount: ' + RecordCount);
+                    system.debug('RecordBatch: ' + RecordBatch);
+                    system.debug('RecordBatch: ' + LastCount);
+                    InsertRecords(DataManager.Object_API_Name__c, DataManager.API_Field_Name__c, DataManager.New_Value__c, DataManager.Add_Suffix_Iterator__c, RecordCount, LastCount);
+                    LastCount += RecordBatch;
+                    CallsMade++;
+                }
+            } else {
+                // Updating
+                system.debug('updating...');
+                query ='SELECT count() FROM ' + DataManager.Object_API_Name__c;
+                system.debug('query: ' + query);
+                TotalRecords = database.countQuery(query);
+                if (TotalRecords > 0) {
+                    // How many future calls do we need
+                    system.debug('TotalRecords: ' + TotalRecords);
+                    TotalCallsNeeded = (TotalRecords / DMLPerTransaction_LIMIT);
+                    TotalCallsNeeded++;
+                    system.debug('TotalCallsNeeded: ' + TotalCallsNeeded);
+                    system.debug('TotalRecords: ' + TotalRecords);
+                    system.debug('DMLPerTransaction_LIMIT: ' + DMLPerTransaction_LIMIT);
+                } else {
+                    throw new DataManagerClassException('No records to update');
+                }
+
+                if (DataManager.Has_Criteria__c) {
+                    if (DataManager.Comparative_Operator__c == 'Equal')
+                        ComparativeOperator = '=';
+                    if (DataManager.Comparative_Operator__c == 'Less Than')
+                        ComparativeOperator = '<';
+                    if (DataManager.Comparative_Operator__c == 'Less Than Equal To')
+                        ComparativeOperator = '<=';
+                    if (DataManager.Comparative_Operator__c == 'Greater Than')
+                        ComparativeOperator = '>';
+                    if (DataManager.Comparative_Operator__c == 'Greater Than Equal To')
+                        ComparativeOperator = '>=';
+                    if (DataManager.Comparative_Operator__c == 'Not Equal')
+                        ComparativeOperator = '!=';
+                    
+                    system.debug('ComparativeOperator: ' + ComparativeOperator);
+                }
+                system.debug('CallsMade: ' + CallsMade);
+                system.debug('TotalCallsNeeded: ' + TotalCallsNeeded);
+                while (CallsMade < TotalCallsNeeded) {
+                    system.debug('LIMITS.getQueryRows(): ' + LIMITS.getQueryRows());
+                    system.debug('IDsMarked.size(): ' + IDsMarked.size());
+                    if (IDsMarked.size() > 0) {
+                        system.debug('idsmarked');
+                        if (DataManager.Has_Criteria__c) {
+                            if (DataManager.Value_Is_Blank__c) {
+                                query = 'SELECT count() FROM ' + DataManager.Object_API_Name__c + ' WHERE ID NOT IN:IDsMarked AND ' + DataManager.Compare_API_Field_Name__c + ' ' + ComparativeOperator + '\' \'' + ' LIMIT  ' + DMLPerTransaction_LIMIT;
+
+                            } else {
+                                query = 'SELECT count() FROM ' + DataManager.Object_API_Name__c + ' WHERE ID NOT IN:IDsMarked AND ' + DataManager.Compare_API_Field_Name__c + ' ' + ComparativeOperator + ' \'' + DataManager.Compare_Value__c + '\' LIMIT  ' + DMLPerTransaction_LIMIT;
+                            }
+                            system.debug('criteria query: ' + query);
+                        } else {
+                            query = 'SELECT count() FROM ' + DataManager.Object_API_Name__c + ' WHERE ID NOT IN:IDsMarked LIMIT  ' + DMLPerTransaction_LIMIT;
+                            system.debug('no criteria query: ' + query);
+                        }
+
+                        if ((database.countQuery(query) + LIMITS.getQueryRows()) > RowsPerTransaction_LIMIT) {
+                            system.debug('over limit');
+                            break;
+                        } else 
+                        {
+                            system.debug('database.countQuery(query): ' + database.countQuery(query));
+                            system.debug('RowsPerTransaction_LIMIT: ' + RowsPerTransaction_LIMIT);
+                            system.debug('LIMITS.getQueryRows(): ' + LIMITS.getQueryRows());
+
+                        }
+
+                        if (DataManager.Has_Criteria__c) {
+                            if (DataManager.Value_Is_Blank__c) {
+                                query = 'SELECT id, ' + DataManager.Compare_API_Field_Name__c + ' FROM ' + DataManager.Object_API_Name__c + ' WHERE ID NOT IN:IDsMarked AND ' + DataManager.Compare_API_Field_Name__c + ' ' + ComparativeOperator + ' \' \'' +   ' LIMIT  ' + DMLPerTransaction_LIMIT;
+                            }
+                            else {
+                                query = 'SELECT id, ' + DataManager.Compare_API_Field_Name__c + ' FROM ' + DataManager.Object_API_Name__c + ' WHERE ID NOT IN:IDsMarked AND ' + DataManager.Compare_API_Field_Name__c + ' ' + ComparativeOperator + ' \''  + DataManager.Compare_Value__c + '\'  LIMIT  ' + DMLPerTransaction_LIMIT;
+                            }
+                            system.debug('2 criteria query: ' + query);
+
+                        } else {
+                            query = 'SELECT id FROM ' + DataManager.Object_API_Name__c + ' WHERE ID NOT IN:IDsMarked LIMIT  ' + DMLPerTransaction_LIMIT;
+                            system.debug('2 no criteria query: ' + query);
+                        }
+                    }
+                    else {
+                        query = 'SELECT count() FROM ' + DataManager.Object_API_Name__c + ' LIMIT ' + DMLPerTransaction_LIMIT;
+                        system.debug('before query: ' + query);
+                        if ((database.countQuery(query) + LIMITS.getQueryRows()) > RowsPerTransaction_LIMIT) {
+                            system.debug('over limit');
+                            break;
+                        } else 
+                        {
+                            system.debug('database.countQuery(query): ' + database.countQuery(query));
+                            system.debug('RowsPerTransaction_LIMIT: ' + RowsPerTransaction_LIMIT);
+                            system.debug('LIMITS.getQueryRows(): ' + LIMITS.getQueryRows());
+
+                        }
+
+                        query = 'SELECT id FROM ' + DataManager.Object_API_Name__c + ' LIMIT  ' + DMLPerTransaction_LIMIT;
+                        system.debug('no marked ids: ' + query);
+                    }
+                    IDsToProcess.Clear();
+                    system.debug('querying...');
+                    system.debug('>>>>>query: ' + query);
+                    objects = database.query(query);
+                    system.debug('objects.size(): ' + objects.size());
+                    if (objects.size() > 0) {
+                        for (SObject obj : objects) {
+                            IDsToProcess.Add(obj.id);
+                            IDsMarked.add(obj.id);
+                        }
+                    } else break;
+
+                    UpdateRecords(DataManager.Object_API_Name__c, DataManager.API_Field_Name__c, DataManager.New_Value__c, IDsToProcess, DataManager.Add_Suffix_Iterator__c, RecordCount, LastCount, DataManager.Compare_Value__c, DataManager.Compare_API_Field_Name__c, DataManager.Value_Is_Blank__c, DataManager.New_Value_Is_Blank__c);
+
+                    LastCount += RecordCount;
+                    CallsMade++;
+                }
+            }
+        }
+    }
+
+     
+    @future 
+    private static void InsertRecords(String APIObjectName, String APIFieldName, String APIFieldValue, Boolean Iterator, Integer RecordCount, Integer LastCount)
+    {
+        system.debug('inside insert RecordCount: ' + RecordCount);
+        system.debug('insert.1');
+        List<SObject> objects = new List<SObject>();
+        system.debug('insert.2');
+        List<ID> ParentIDs = new List<ID>();
+        system.debug('insert.3');
+        Integer ParentRecordCount = 0;
+        system.debug('insert.4');
+        String ParentObject = '';
+        system.debug('insert.5');
+        String query = '';
+        system.debug('insert.6');
+
+        if (APIFieldValue.indexOf('@')==0) {
+        system.debug('insert.7');
+            ParentObject = APIFieldValue.Replace('@','');
+            query = 'SELECT ID FROM ' + ParentObject + ' LIMIT ' + DMLPerTransaction_LIMIT;
+            objects = database.query(query);
+            for (SObject obj : objects) {
+        system.debug('insert.8');
+                ParentIDs.Add(obj.id);
+            }            
+        system.debug('insert.9');
+            objects = new List<SObject>();
+        }
+        system.debug('insert.10');
+        
+        try {
+            for (Integer i = 0; i < RecordCount; i ++) {
+                system.debug('a.1');
+                SObject obj =  (SObject)Type.forName(APIObjectName).newInstance();
+                system.debug('a.2');
+                if (ParentObject == '') {
+                system.debug('a.3');
+                    // No parent record
+                    if (Iterator) {
+                system.debug('a.4');
+                        obj.put(APIFieldName, APIFieldValue + (i + LastCount));
+                    }
+                    else {
+                system.debug('a.5');
+                        obj.put(APIFieldName, APIFieldValue);
+                    }
+                system.debug('a.6');
+                } else {
+                    // Parent record
+                    system.debug('APIObjectName: ' + APIObjectName);
+                    system.debug('ParentIds[ParentRecordCount]: ' + ParentIds[ParentRecordCount]);
+                    system.debug('APIFieldName: ' + APIFieldName);
+                    obj.put(APIFieldName, ParentIds[ParentRecordCount]);
+                    system.debug('ob1');
+                    ParentRecordCount++;
+                    if (ParentRecordCount >= ParentIDs.Size()) ParentRecordCount = 0;
+                }
+                objects.add(obj);
+            }
+            insert objects;
+        } catch (Exception e) {
+            System.debug('Error Insert Records ' + e.getMessage());
+        }
+    }
+
+    @future 
+    private static void UpdateRecords(String APIObjectName, String APIFieldName, String APIFieldValue, List<ID> IDsToProcess, boolean Iterator,Integer RecordCount, Integer LastCount, String Compare_Value, String Compare_API_Field_Name, Boolean Value_Is_Blank, Boolean New_Value_Is_Blank)
+    {
+        Boolean CanUpdate = true;
+        List<ID> ParentIDs = new List<ID>();
+        Integer ParentRecordCount = 0;
+        String ParentObject = '';
+        String query = '';
+
+        system.debug('inside updaterecords');
+        if (APIFieldValue.indexOf('@')==0) {
+            ParentObject = APIFieldValue.Replace('@','');
+            query = 'SELECT ID FROM ' + ParentObject + ' LIMIT ' + DMLPerTransaction_LIMIT;
+            objects = database.query(query);
+            for (SObject obj : objects) {
+                ParentIDs.Add(obj.id);
+            }            
+        }
+
+        system.debug('ParentIDs.Size(): ' + ParentIDs.size());
+        query = 'SELECT ID, ' + APIFieldName + ' FROM ' + APIObjectName + ' WHERE ID IN :IDsToProcess LIMIT ' + DMLPerTransaction_LIMIT;
+        system.debug('Update Records query: ' + query);
+        List<SObject> objects = database.query(query);
+
+        for (SObject obj : objects) {
+            try {
+               /* 
+                if (Has_Criteria){
+                    if (Value_Is_Blank) {
+                        CanUpdate = (obj.get(Compare_API_Field_Name) == '');
+                    }
+                    else {
+                        CanUpdate = (obj.get(Compare_API_Field_Name) == Compare_Value);
+                    }
+                } else {
+                    CanUpdate = true; // no criteria
+                }
+                */
+                if (true) {
+                    system.debug('1');
+                    if (ParentIds.size() > 0 ){
+                    system.debug('2');
+                    system.debug('ParentRecordCount: ' + ParentRecordCount);
+                    system.debug('ParentIDs.size(): ' + ParentIDs.size());
+                        obj.put(APIFieldName,ParentIDs[ParentRecordCount]);
+                        ParentRecordCount++;
+                        if (ParentRecordCount > ParentIDs.size() - 1)
+                            ParentRecordCount = 0;
+                    system.debug('3');
+                    }
+                    else  {
+                        obj.put(APIFieldName,APIFieldValue);
+                    }
+                }
+            } catch (Exception e) {
+                system.debug('UpdateRecords ' + e.getMessage());
+            }
+        }
+        system.debug('Update objects: ' + objects.size());
+        try {
+            system.debug('objects[0]: ' + objects[0]);
+            Update objects;
+        } catch (Exception e) {
+            system.debug('what ' + e.getMessage());
+        }
+    }
+}
